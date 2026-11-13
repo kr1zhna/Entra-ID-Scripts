@@ -5,10 +5,10 @@
 .SYNOPSIS
 Provisions and verifies the Microsoft Graph-only access package from the supplied guide.
 .DESCRIPTION
-Uses the Microsoft Graph PowerShell SDK and device-code authentication. The only
+Uses the Microsoft Graph PowerShell SDK and interactive browser authentication. The only
 configuration prompt is for the fallback approver's Entra user object ID (a GUID).
-For sign-in, open the displayed device-login URL and enter the SDK's one-time code.
-Complete browser sign-in, consent, and any MFA prompts; the script waits for completion.
+For sign-in, complete the browser prompt from Microsoft Graph. Complete consent and
+any MFA prompts; the script waits for completion.
 No application registration, client secret, package resource, or test request is created.
 
 Prerequisites: licensed Entra entitlement management, an Identity Governance
@@ -267,7 +267,6 @@ try {
 
     $connectArguments = @{
         Scopes        = @('EntitlementManagement.ReadWrite.All', 'Application.Read.All')
-        UseDeviceCode = $true
         ContextScope  = 'Process'
         Environment   = 'Global'
         NoWelcome     = $true
@@ -276,17 +275,15 @@ try {
     if ($script:provisioningState.TenantId) {
         $connectArguments.TenantId = $script:provisioningState.TenantId
     }
-    Write-Host 'Microsoft Graph sign-in is required (device-code authentication).'
-    Write-Host 'Open https://microsoft.com/devicelogin and enter the one-time code displayed by Microsoft Graph below.'
+    Write-Host 'Microsoft Graph sign-in is required (interactive browser authentication).'
     Write-Host 'Sign in with an Identity Governance Administrator account in the intended tenant. Complete any consent/MFA prompts; this script waits for sign-in to finish.'
-    # The SDK emits the device-code message on the success stream, not just the host.
-    Connect-MgGraph @connectArguments | ForEach-Object { Write-Host $_ }
+    Connect-MgGraph @connectArguments | Out-Null
     $connected = $true
     $context = Get-MgContext
     $tenantId = [guid]::Empty
     if ($null -eq $context -or $context.AuthType -ne 'Delegated' -or
         -not [guid]::TryParse([string]$context.TenantId, [ref]$tenantId) -or $tenantId -eq [guid]::Empty) {
-        throw 'Device-code sign-in did not return a delegated tenant context.'
+        throw 'Interactive sign-in did not return a delegated tenant context.'
     }
     if ($script:provisioningState.TenantId -and $script:provisioningState.TenantId -ne $tenantId.ToString()) {
         throw 'The authenticated tenant does not match the saved deployment.'
