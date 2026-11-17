@@ -23,6 +23,7 @@ partial deployment or re-verify a completed deployment without creating duplicat
 Do not delete it to work around an uncertain POST result.
 If a catalog with the configured display name already exists, the script reuses it.
 If the Graph catalog role assignment already exists for that catalog, it is reused.
+If the access package already exists in that catalog, it is reused.
 
 The package is hidden and users cannot self-request or self-remove it; only the
 Microsoft Graph on-behalf requestor can submit requests. Independent administrator
@@ -234,6 +235,42 @@ function Get-ExistingCatalogRoleAssignmentId {
     return $roleId.ToString()
 }
 
+function Get-ExistingAccessPackageId {
+    param(
+        [string]$DisplayName,
+        [string]$CatalogId
+    )
+
+    $catalogGuid = [guid]::Empty
+    if (-not [guid]::TryParse($CatalogId, [ref]$catalogGuid) -or $catalogGuid -eq [guid]::Empty) {
+        throw "Catalog ID '$CatalogId' is invalid for access package lookup."
+    }
+    $targetCatalogId = $catalogGuid.ToString()
+    $escapedDisplayName = $DisplayName.Replace("'", "''")
+    $packageFilter = [uri]::EscapeDataString("displayName eq '$escapedDisplayName'")
+    $packages = @(Get-GraphCollection -Uri "$graphBase/identityGovernance/entitlementManagement/accessPackages?`$filter=$packageFilter&`$expand=catalog&`$select=id,displayName")
+
+    $matchingPackages = @($packages | Where-Object {
+        $packageCatalogId = [guid]::Empty
+        [guid]::TryParse([string]$_.catalog.id, [ref]$packageCatalogId) -and
+        $packageCatalogId -ne [guid]::Empty -and
+        $packageCatalogId.ToString() -eq $targetCatalogId
+    })
+
+    if ($matchingPackages.Count -gt 1) {
+        throw "Multiple access packages named '$DisplayName' already exist in catalog '$targetCatalogId'."
+    }
+    if ($matchingPackages.Count -eq 0) {
+        return $null
+    }
+
+    $packageId = [guid]::Empty
+    if (-not [guid]::TryParse([string]$matchingPackages[0].id, [ref]$packageId) -or $packageId -eq [guid]::Empty) {
+        throw "Access package lookup for '$DisplayName' returned an invalid ID."
+    }
+    return $packageId.ToString()
+}
+
 if ([string]::IsNullOrWhiteSpace($FallbackApproverUserId)) {
     $FallbackApproverUserId = Read-Host 'Fallback approver user object ID (GUID)'
 }
@@ -316,7 +353,7 @@ try {
             }
         }
         $script:provisioningState = $saved
-        if ($saved.PendingOperation -and $saved.PendingOperation -notin @('CatalogId', 'GraphCatalogRoleAssignmentId')) {
+        if ($saved.PendingOperation -and $saved.PendingOperation -notin @('CatalogId', 'GraphCatalogRoleAssignmentId', 'AccessPackageId')) {
             throw "Uncertain previous creation: $($saved.PendingOperation). Inspect the tenant and reconcile that ID in $script:resolvedStatePath before clearing PendingOperation. Do not blindly retry or delete the state file."
         }
     }
@@ -432,6 +469,24 @@ try {
         catalog     = @{ id = $catalogId }
     }
     $packageUri = "$graphBase/identityGovernance/entitlementManagement/accessPackages"
+    if ($script:provisioningState.PendingOperation -eq 'AccessPackageId') {
+        $reconciledPackageId = Get-ExistingAccessPackageId -DisplayName $packageBody.displayName -CatalogId $catalogId
+        if (-not $reconciledPackageId) {
+            throw "Pending AccessPackageId could not be reconciled for package '$($packageBody.displayName)' in catalog '$catalogId'."
+        }
+        $script:provisioningState.AccessPackageId = $reconciledPackageId
+        $script:provisioningState.PendingOperation = $null
+        Save-ProvisioningState
+        Write-Host "Reconciled pending AccessPackageId to existing access package: $reconciledPackageId"
+    }
+    elseif (-not $script:provisioningState.AccessPackageId) {
+        $existingPackageId = Get-ExistingAccessPackageId -DisplayName $packageBody.displayName -CatalogId $catalogId
+        if ($existingPackageId) {
+            $script:provisioningState.AccessPackageId = $existingPackageId
+            Save-ProvisioningState
+            Write-Host "Reusing existing access package '$($packageBody.displayName)' in catalog '$catalogId': $existingPackageId"
+        }
+    }
     $packageId = Get-ProvisionedGraphObject -StateProperty 'AccessPackageId' `
         -CollectionUri $packageUri -ReadQuery '?$expand=catalog' -Body $packageBody
 
