@@ -25,6 +25,7 @@ If a catalog with the configured display name already exists, the script reuses 
 If the Graph catalog role assignment already exists for that catalog, it is reused.
 If the access package already exists in that catalog, it is reused.
 If any other access package exists in that catalog, the script stops without changes.
+When reusing the access package, either hidden or visible state is accepted.
 
 The package is hidden and users cannot self-request or self-remove it; only the
 Microsoft Graph on-behalf requestor can submit requests. Independent administrator
@@ -156,13 +157,18 @@ function Get-ProvisionedGraphObject {
         [string]$StateProperty,
         [string]$CollectionUri,
         [System.Collections.IDictionary]$Body,
+        [System.Collections.IDictionary]$ReadExpectedBody,
         [string]$ReadQuery = ''
     )
+
+    if (-not $PSBoundParameters.ContainsKey('ReadExpectedBody')) {
+        $ReadExpectedBody = $Body
+    }
 
     $id = $script:provisioningState.$StateProperty
     if ($id) {
         $existing = Invoke-GraphJson -Uri "$CollectionUri/$([uri]::EscapeDataString($id))$ReadQuery"
-        Test-GraphConfiguration -Actual $existing -Expected $Body -Path $StateProperty
+        Test-GraphConfiguration -Actual $existing -Expected $ReadExpectedBody -Path $StateProperty
         return $id
     }
 
@@ -503,6 +509,11 @@ try {
         isHidden    = $true
         catalog     = @{ id = $catalogId }
     }
+    $packageReadExpectedBody = @{
+        displayName = $targetAccessPackageName
+        description = 'Approval-only package; no resource roles.'
+        catalog     = @{ id = $catalogId }
+    }
     $packageUri = "$graphBase/identityGovernance/entitlementManagement/accessPackages"
     if ($script:provisioningState.PendingOperation -eq 'AccessPackageId') {
         $reconciledPackageId = Get-ExistingAccessPackageId -DisplayName $packageBody.displayName -CatalogId $catalogId
@@ -523,7 +534,8 @@ try {
         }
     }
     $packageId = Get-ProvisionedGraphObject -StateProperty 'AccessPackageId' `
-        -CollectionUri $packageUri -ReadQuery '?$expand=catalog' -Body $packageBody
+        -CollectionUri $packageUri -ReadQuery '?$expand=catalog' `
+        -Body $packageBody -ReadExpectedBody $packageReadExpectedBody
 
     $policyBody = @{
         displayName            = 'Human Approval - Microsoft Graph Requestor'
