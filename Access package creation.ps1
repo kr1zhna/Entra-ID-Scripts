@@ -22,6 +22,7 @@ The JSON state file stores tenant/object IDs, not tokens. Keep it to resume a
 partial deployment or re-verify a completed deployment without creating duplicates.
 Do not delete it to work around an uncertain POST result.
 If a catalog with the configured display name already exists, the script reuses it.
+If the Graph catalog role assignment already exists for that catalog, it is reused.
 
 The package is hidden and users cannot self-request or self-remove it; only the
 Microsoft Graph on-behalf requestor can submit requests. Independent administrator
@@ -199,6 +200,40 @@ function Get-CatalogIdByDisplayName {
     return $catalogId.ToString()
 }
 
+function Get-ExistingCatalogRoleAssignmentId {
+    param(
+        [string]$PrincipalId,
+        [string]$RoleDefinitionId,
+        [string]$AppScopeId
+    )
+
+    $roleFilter = [uri]::EscapeDataString("principalId eq '$PrincipalId'")
+    $roles = @(Get-GraphCollection -Uri "$graphBase/roleManagement/entitlementManagement/roleAssignments?`$filter=$roleFilter&`$select=id,principalId,roleDefinitionId,appScopeId")
+    $normalizeScope = {
+        param([string]$Scope)
+        if ([string]::IsNullOrWhiteSpace($Scope)) { return $null }
+        return $Scope.Trim().Trim('/').ToLowerInvariant()
+    }
+    $targetScope = & $normalizeScope $AppScopeId
+    $matchingRoles = @($roles | Where-Object {
+        $_.principalId -eq $PrincipalId -and
+        $_.roleDefinitionId -eq $RoleDefinitionId -and
+        (& $normalizeScope $_.appScopeId) -eq $targetScope
+    })
+    if ($matchingRoles.Count -gt 1) {
+        throw "Multiple matching role assignments already exist for principal '$PrincipalId' and scope '$AppScopeId'."
+    }
+    if ($matchingRoles.Count -eq 0) {
+        return $null
+    }
+
+    $roleId = [guid]::Empty
+    if (-not [guid]::TryParse([string]$matchingRoles[0].id, [ref]$roleId) -or $roleId -eq [guid]::Empty) {
+        throw 'Role assignment lookup returned an invalid ID.'
+    }
+    return $roleId.ToString()
+}
+
 if ([string]::IsNullOrWhiteSpace($FallbackApproverUserId)) {
     $FallbackApproverUserId = Read-Host 'Fallback approver user object ID (GUID)'
 }
@@ -281,7 +316,7 @@ try {
             }
         }
         $script:provisioningState = $saved
-        if ($saved.PendingOperation -and $saved.PendingOperation -ne 'CatalogId') {
+        if ($saved.PendingOperation -and $saved.PendingOperation -notin @('CatalogId', 'GraphCatalogRoleAssignmentId')) {
             throw "Uncertain previous creation: $($saved.PendingOperation). Inspect the tenant and reconcile that ID in $script:resolvedStatePath before clearing PendingOperation. Do not blindly retry or delete the state file."
         }
     }
@@ -362,6 +397,30 @@ try {
         principalId      = $graphServicePrincipalId
         roleDefinitionId = $assignmentManagerRoleId
         appScopeId       = "/AccessPackageCatalog/$catalogId"
+    }
+    if ($script:provisioningState.PendingOperation -eq 'GraphCatalogRoleAssignmentId') {
+        $reconciledRoleId = Get-ExistingCatalogRoleAssignmentId `
+            -PrincipalId $roleBody.principalId `
+            -RoleDefinitionId $roleBody.roleDefinitionId `
+            -AppScopeId $roleBody.appScopeId
+        if (-not $reconciledRoleId) {
+            throw "Pending GraphCatalogRoleAssignmentId could not be reconciled for scope '$($roleBody.appScopeId)'."
+        }
+        $script:provisioningState.GraphCatalogRoleAssignmentId = $reconciledRoleId
+        $script:provisioningState.PendingOperation = $null
+        Save-ProvisioningState
+        Write-Host "Reconciled pending GraphCatalogRoleAssignmentId to existing role assignment: $reconciledRoleId"
+    }
+    elseif (-not $script:provisioningState.GraphCatalogRoleAssignmentId) {
+        $existingRoleId = Get-ExistingCatalogRoleAssignmentId `
+            -PrincipalId $roleBody.principalId `
+            -RoleDefinitionId $roleBody.roleDefinitionId `
+            -AppScopeId $roleBody.appScopeId
+        if ($existingRoleId) {
+            $script:provisioningState.GraphCatalogRoleAssignmentId = $existingRoleId
+            Save-ProvisioningState
+            Write-Host "Reusing existing Graph catalog role assignment: $existingRoleId"
+        }
     }
     $roleId = Get-ProvisionedGraphObject -StateProperty 'GraphCatalogRoleAssignmentId' `
         -CollectionUri "$graphBase/roleManagement/entitlementManagement/roleAssignments" -Body $roleBody
