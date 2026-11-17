@@ -24,6 +24,7 @@ Do not delete it to work around an uncertain POST result.
 If a catalog with the configured display name already exists, the script reuses it.
 If the Graph catalog role assignment already exists for that catalog, it is reused.
 If the access package already exists in that catalog, it is reused.
+If any other access package exists in that catalog, the script stops without changes.
 
 The package is hidden and users cannot self-request or self-remove it; only the
 Microsoft Graph on-behalf requestor can submit requests. Independent administrator
@@ -271,6 +272,37 @@ function Get-ExistingAccessPackageId {
     return $packageId.ToString()
 }
 
+function Get-AccessPackagesInCatalog {
+    param([string]$CatalogId)
+
+    $catalogGuid = [guid]::Empty
+    if (-not [guid]::TryParse($CatalogId, [ref]$catalogGuid) -or $catalogGuid -eq [guid]::Empty) {
+        throw "Catalog ID '$CatalogId' is invalid for package enumeration."
+    }
+    $targetCatalogId = $catalogGuid.ToString()
+
+    $packages = @(Get-GraphCollection -Uri "$graphBase/identityGovernance/entitlementManagement/accessPackages?`$expand=catalog&`$select=id,displayName")
+    @($packages | Where-Object {
+        $packageCatalogId = [guid]::Empty
+        [guid]::TryParse([string]$_.catalog.id, [ref]$packageCatalogId) -and
+        $packageCatalogId -ne [guid]::Empty -and
+        $packageCatalogId.ToString() -eq $targetCatalogId
+    })
+}
+
+function Assert-CatalogContainsOnlyTargetPackage {
+    param(
+        [string]$CatalogId,
+        [string]$TargetPackageName
+    )
+
+    $otherPackages = @(Get-AccessPackagesInCatalog -CatalogId $CatalogId | Where-Object { $_.displayName -ne $TargetPackageName })
+    if ($otherPackages.Count -gt 0) {
+        $otherNames = ($otherPackages | ForEach-Object { "'$($_.displayName)'" }) -join ', '
+        throw "Catalog '$CatalogId' contains other access packages ($otherNames). Refusing to proceed to avoid touching anything except '$TargetPackageName'."
+    }
+}
+
 if ([string]::IsNullOrWhiteSpace($FallbackApproverUserId)) {
     $FallbackApproverUserId = Read-Host 'Fallback approver user object ID (GUID)'
 }
@@ -430,6 +462,9 @@ try {
     $catalogId = Get-ProvisionedGraphObject -StateProperty 'CatalogId' `
         -CollectionUri "$graphBase/identityGovernance/entitlementManagement/catalogs" -Body $catalogBody
 
+    $targetAccessPackageName = 'Human Approval Access Package'
+    Assert-CatalogContainsOnlyTargetPackage -CatalogId $catalogId -TargetPackageName $targetAccessPackageName
+
     $roleBody = @{
         principalId      = $graphServicePrincipalId
         roleDefinitionId = $assignmentManagerRoleId
@@ -463,7 +498,7 @@ try {
         -CollectionUri "$graphBase/roleManagement/entitlementManagement/roleAssignments" -Body $roleBody
 
     $packageBody = @{
-        displayName = 'Human Approval Access Package'
+        displayName = $targetAccessPackageName
         description = 'Approval-only package; no resource roles.'
         isHidden    = $true
         catalog     = @{ id = $catalogId }
