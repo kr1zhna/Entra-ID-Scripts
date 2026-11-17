@@ -21,6 +21,7 @@ Install the SDK module once if needed:
 The JSON state file stores tenant/object IDs, not tokens. Keep it to resume a
 partial deployment or re-verify a completed deployment without creating duplicates.
 Do not delete it to work around an uncertain POST result.
+If a catalog with the configured display name already exists, the script reuses it.
 
 The package is hidden and users cannot self-request or self-remove it; only the
 Microsoft Graph on-behalf requestor can submit requests. Independent administrator
@@ -178,6 +179,26 @@ function Get-ProvisionedGraphObject {
     return $id
 }
 
+function Get-CatalogIdByDisplayName {
+    param([string]$DisplayName)
+
+    $escapedDisplayName = $DisplayName.Replace("'", "''")
+    $catalogFilter = [uri]::EscapeDataString("displayName eq '$escapedDisplayName'")
+    $catalogs = @(Get-GraphCollection -Uri "$graphBase/identityGovernance/entitlementManagement/catalogs?`$filter=$catalogFilter&`$select=id,displayName")
+    if ($catalogs.Count -gt 1) {
+        throw "Multiple catalogs matched display name '$DisplayName'. Use a unique CatalogDisplayName."
+    }
+    if ($catalogs.Count -eq 0) {
+        return $null
+    }
+
+    $catalogId = [guid]::Empty
+    if (-not [guid]::TryParse([string]$catalogs[0].id, [ref]$catalogId) -or $catalogId -eq [guid]::Empty) {
+        throw "Catalog lookup for '$DisplayName' returned an invalid ID."
+    }
+    return $catalogId.ToString()
+}
+
 if ([string]::IsNullOrWhiteSpace($FallbackApproverUserId)) {
     $FallbackApproverUserId = Read-Host 'Fallback approver user object ID (GUID)'
 }
@@ -260,7 +281,7 @@ try {
             }
         }
         $script:provisioningState = $saved
-        if ($saved.PendingOperation) {
+        if ($saved.PendingOperation -and $saved.PendingOperation -ne 'CatalogId') {
             throw "Uncertain previous creation: $($saved.PendingOperation). Inspect the tenant and reconcile that ID in $script:resolvedStatePath before clearing PendingOperation. Do not blindly retry or delete the state file."
         }
     }
@@ -315,6 +336,24 @@ try {
         description         = 'Dedicated catalog for approval-only access packages.'
         state               = 'published'
         isExternallyVisible = $false
+    }
+    if ($script:provisioningState.PendingOperation -eq 'CatalogId') {
+        $reconciledCatalogId = Get-CatalogIdByDisplayName -DisplayName $script:provisioningState.CatalogDisplayName
+        if (-not $reconciledCatalogId) {
+            throw "Pending CatalogId could not be reconciled because no catalog named '$($script:provisioningState.CatalogDisplayName)' was found."
+        }
+        $script:provisioningState.CatalogId = $reconciledCatalogId
+        $script:provisioningState.PendingOperation = $null
+        Save-ProvisioningState
+        Write-Host "Reconciled pending CatalogId to existing catalog: $reconciledCatalogId"
+    }
+    elseif (-not $script:provisioningState.CatalogId) {
+        $existingCatalogId = Get-CatalogIdByDisplayName -DisplayName $script:provisioningState.CatalogDisplayName
+        if ($existingCatalogId) {
+            $script:provisioningState.CatalogId = $existingCatalogId
+            Save-ProvisioningState
+            Write-Host "Reusing existing catalog '$($script:provisioningState.CatalogDisplayName)': $existingCatalogId"
+        }
     }
     $catalogId = Get-ProvisionedGraphObject -StateProperty 'CatalogId' `
         -CollectionUri "$graphBase/identityGovernance/entitlementManagement/catalogs" -Body $catalogBody
